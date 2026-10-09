@@ -1,0 +1,13 @@
+# 個人設定與機密（不上傳；請由 config.example.h 複製）
+XiaoKe_P4/config.h
+
+# 原廠韌體備份（屬原廠所有）
+backup/
+
+# 樂鑫 ESP-Hosted 韌體（請由 C6_Update 說明的官方網址下載）
+C6_Update/firmware/
+
+# 產品說明文件與暫存檔
+*.docx
+~$*
+build/
