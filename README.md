@@ -1,5 +1,5 @@
-# 小柯 AI 語音機器人：ESP32-P4 七吋版
-
+# 小柯 AI 語音機器人：ESP32-P4 七吋版 
+<img width="1468" height="877" alt="image" src="https://github.com/user-attachments/assets/ba519ba3-57d8-4d60-9554-fedb211ac241" />
 把「小柯」AI 語音視覺聊天機器人（OpenAI 版）移植到 **Guition JC1060P470C**（ESP32-P4 + ESP32-C6、7 吋 1024×600 觸控螢幕）。
 
 ## 功能
