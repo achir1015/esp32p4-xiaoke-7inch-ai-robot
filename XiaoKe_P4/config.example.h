@@ -62,6 +62,12 @@
 #define YT_PLAYLIST_URL   "https://www.youtube.com/playlist?list=PLMiXt5EIkXI0"
 #define SONG_COMPOSER     "吳玉柱"   // 詞曲創作者（版權所有）
 #define SONG_SHOW_SEC     180        // 唱歌畫面停留秒數（按鍵可提早回到聊天）
+// 雲端硬碟 MP3 資料夾（自己創作的歌，小柯會直接唱出來）：資料夾設成「知道連結的任何人都能檢視」，貼上資料夾網址；留空 = 只顯示 QR 碼
+// MP3 建議：單聲道、24kHz、80kbps（ffmpeg -ac 1 -ar 24000 -b:a 80k），檔名 = 歌名.mp3（與 YouTube 歌名相同就會顯示封面與 QR 碼）
+#define SONGS_MP3_FOLDER  ""
+// 雲端硬碟 MV 資料夾：放 tools/make_xkv.py 由 MP4 轉成的 .xkv 檔（說「播 MV」「播千江有水千江月的 MV」）；同樣要設成知道連結的人可檢視
+#define SONGS_MV_FOLDER   ""
+#define MV_BRIGHTNESS     50         // 播 MV 時的螢幕亮度（電腦 USB 供電時太亮可能掉電重開機）
 
 // ------------------------------------------------------------ 病房助理工作站（QR 碼）----
 // 說到「長照」「照服員」「居服員」「居家督導」等關鍵字時，顯示工作站 QR 碼讓手機掃描查詢

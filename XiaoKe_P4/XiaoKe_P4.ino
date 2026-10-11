@@ -32,6 +32,8 @@
 #include "p4_hw.h"
 #include "almanac.h"
 #include "hal/brownout_hal.h"
+#include "mp3dec.h"
+#include "song_types.h"
 
 // ------------------------------------------------------------------ 顏色 ----
 constexpr uint16_t RGB(uint8_t r, uint8_t g, uint8_t b) { return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); }
@@ -243,7 +245,7 @@ class CjkText {
 CjkText u8f;
 
 // ---------------------------------------------------------------- UI 狀態 ----
-enum UiState { UI_IDLE, UI_LISTEN, UI_THINK, UI_SPEAK, UI_MSG, UI_HELP, UI_SONG, UI_CAMERA, UI_QR };
+enum UiState { UI_IDLE, UI_LISTEN, UI_THINK, UI_SPEAK, UI_MSG, UI_HELP, UI_SONG, UI_CAMERA, UI_QR, UI_VIDEO, UI_PORTAL };
 volatile UiState uiState = UI_IDLE;
 String uiTitle, uiText;
 uint32_t uiSince = 0;
@@ -267,6 +269,9 @@ std::vector<Song> songs;
 SemaphoreHandle_t songLock = nullptr;
 uint16_t *thumbPix = nullptr;      // 歌曲封面 320x180 RGB565（PSRAM）
 volatile bool thumbOk = false;
+volatile bool portalOpen = false;                          // 工作站選單開著（回答問題後回到選單）
+volatile bool songPlaying = false, songLoading = false;   // 播放雲端 MP3 中／下載中
+volatile uint32_t songPosMs = 0, songDurMs = 0;
 uint8_t qrMods[45 * 45];           // QR 碼模組（最多 version 7 = 45x45）
 volatile int qrSize = 0;
 
@@ -523,14 +528,14 @@ void buildHelp() {
     {"2. 上網查詢：問天氣、新聞、股價、比賽結果等即時資訊，" ROBOT_NAME "會自己上網搜尋再用口語回答。", C_WHITE},
     {"3. 班表查詢：問「我明天上什麼班」「這個月休幾天」「誰明天上大夜」，讀取病房助理與護理師月班表回答。", C_WHITE},
     {"4. 工作流程：問「白班幾點交班」「大夜班有哪些工作」「現在該做什麼」，依工作時間軸回答。", C_WHITE},
-    {"5. 長照查詢：說「長照」「照服員」「居服員」「居家督導」等，顯示" PORTAL_NAME "的 QR 碼，手機掃描進入查詢。", C_WHITE},
+    {"5. " PORTAL_NAME "：點主畫面右下角按鈕或說「工作站」開啟觸控選單，點工具看說明與 QR 碼；技術稽核、督導手冊、學科題庫、術科、長照組合的內容可以直接用說的問（例如「冰枕的稽核項目有哪些」）。", C_WHITE},
     {"【影像】", C_GLOW},
     {"6. 拍照辨識：說「拍照」「這是什麼」「上面寫什麼」，拍照後回答，照片顯示在螢幕並存到雲端硬碟。", C_WHITE},
     {"7. 攝影：說「攝影」「開鏡頭」顯示 200 萬畫素鏡頭即時影像（綠字攝影中），仍可繼續下指令；說「關閉鏡頭」或點螢幕回主畫面。", C_WHITE},
     {"8. 錄製：攝影中說「錄製」開始錄有聲影片（紅字錄製中），說「停止」後說「存檔中」並上傳雲端硬碟，最長約 2 分鐘。", C_WHITE},
     {"9. 鏡頭色彩：在設定網頁可即時調整白平衡、飽和度、亮度、對比。", C_WHITE},
     {"【娛樂與生活】", C_GLOW},
-    {"10. 唱歌：說「唱首歌」，從" SONG_COMPOSER "的 YouTube 創作歌單隨機選一首，手機掃 QR 碼播放。", C_WHITE},
+    {"10. 唱歌：說「唱首歌」隨機唱一首" SONG_COMPOSER "的創作歌曲，也可以點歌（例如「唱千江有水千江月」）；歌曲放在雲端硬碟資料夾，點螢幕停止。", C_WHITE},
     {"11. 時間與農民曆：上方顯示日期、星期、農曆與 24 小時制時間；右側農民曆顯示干支、生肖、宜忌、沖煞與節氣（建除十二神簡易版，僅供參考），也可以問「今天宜什麼」「今天農曆幾號」。", C_WHITE},
     {"12. 表情：依心情開心、愛心、驚訝、難過、生氣、眨眼、害羞；太久沒互動會想睡覺。", C_WHITE},
     {"13. 音量與記憶：說「大聲一點／小聲一點」調音量；說「清除記憶」重新開始對話。", C_WHITE},
@@ -640,7 +645,17 @@ void drawSong(const String &title, uint32_t now) {
 
   drawQr(344, 52, 160);
   u8f.setForegroundColor(C_GRAY);
-  u8f.drawUTF8(344 + (160 - u8f.getUTF8Width("手機掃描 YouTube")) / 2, 230, "手機掃描 YouTube");
+  if (qrSize > 0) u8f.drawUTF8(344 + (160 - u8f.getUTF8Width("手機掃描 YouTube")) / 2, 230, "手機掃描 YouTube");
+  char st[40] = "";
+  if (songLoading) snprintf(st, sizeof(st), "歌曲下載中…");
+  else if (songPlaying) snprintf(st, sizeof(st), "播放 %u:%02u / %u:%02u", (unsigned)(songPosMs / 60000), (unsigned)(songPosMs / 1000 % 60),
+                                 (unsigned)(songDurMs / 60000), (unsigned)(songDurMs / 1000 % 60));
+  if (st[0]) {
+    u8f.setForegroundColor(C_GREEN);
+    u8f.drawUTF8(344, 252, st);
+    u8f.setForegroundColor(C_GRAY);
+    u8f.drawUTF8(344, 272, "點螢幕：停止");
+  }
 
   // 歌名與創作者
   u8f.setForegroundColor(C_ORANGE);
@@ -842,9 +857,18 @@ void uiTask(void *) {
       default:        ex = sleepy ? EX_SLEEPY : now < idleUntil ? idleExpr : EX_NORMAL;
     }
     float mouth = st == UI_SPEAK ? constrain(speakLevel / 6000.0f, 0.0f, 1.0f) : 0;
+    if (st == UI_VIDEO) { vTaskDelay(pdMS_TO_TICKS(30)); continue; }   // 播 MV：畫面由播放器自己畫
 
     if (cameraActive && (st == UI_IDLE || st == UI_LISTEN || st == UI_CAMERA)) {   // 攝影：鏡頭即時影像（全螢幕）
+      uint32_t tg = millis();
       bool ok = cameraOK && camGrab(hiBuf + 12 * LCD_W, LCD_W, 576, LCD_W);
+      static uint32_t camLog = 0, camFrames = 0;
+      camFrames++;
+      if (millis() - camLog > 2000) {
+        Serial.printf("[攝影] ok=%d grab=%ums 張數=%u 內部RAM=%uK\n", ok, (unsigned)(millis() - tg), (unsigned)camFrames,
+                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+        camLog = millis(); camFrames = 0;
+      }
       fillRectHi(0, 0, LCD_W, 12, C_BG);
       fillRectHi(0, 588, LCD_W, 12, C_BG);
       if (!ok) {
@@ -874,9 +898,10 @@ void uiTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
-    if (st == UI_QR || st == UI_SONG || (st == UI_HELP && helpPages.size())) {
+    if (st == UI_QR || st == UI_SONG || st == UI_PORTAL || (st == UI_HELP && helpPages.size())) {
       cv->fillScreen(C_BG);
       if (st == UI_QR) drawPortal(title, text, now);
+      else if (st == UI_PORTAL) drawPortalMenu(now);
       else if (st == UI_SONG) drawSong(title, now);
       else drawHelp(now);
       drawTopBar();
@@ -908,8 +933,7 @@ void uiTask(void *) {
       u8f.setForegroundColor(C_GLOW_DIM);
       u8f.drawUTF8(8, 296, ipText);                                  // 設定網頁位址
       drawMicBars(266, 296, st == UI_LISTEN);
-      u8f.setForegroundColor(C_GRAY);
-      u8f.drawUTF8(300, 292, "點螢幕：功能說明");
+      drawBtn(BTN_PORTAL_IDLE, PORTAL_NAME, C_GLOW_DIM, C_WHITE);   // 點這裡開工作站，其他地方 = 功能說明
     } else {
       if (photoShow) {                                              // 回答時左側顯示照片縮圖
         const int TWD = 176, THT = 99, X0 = 8, Y0 = 170;            // 邏輯座標
@@ -1022,7 +1046,10 @@ size_t recordUtterance(bool byButton) {
     // 去掉尾端靜音（保留 200ms）
     size_t trim = (size_t)max(0, silentMs - 200) * MIC_SAMPLE_RATE / 1000;
     n = n > trim ? n - trim : 0;
-    if (voicedMs < VAD_MIN_SPEECH_MS) return 0;
+    if (voicedMs < VAD_MIN_SPEECH_MS) {
+      Serial.printf("[VAD] 太短：有聲 %dms、共 %ums、平均音量 %.0f、門檻 %d\n", voicedMs, (unsigned)(frames * 20), lastRecAvgRms, thr);
+      return 0;
+    }
   } else if (n < MIC_SAMPLE_RATE / 2) {
     return 0;
   }
@@ -1178,8 +1205,8 @@ void queuePhotoUpload(const uint8_t *jpg, size_t len) {
   memcpy(u->jpg, jpg, len);
   u->len = len;
   struct tm t;
-  if (getLocalTime(&t, 10)) strftime(u->name, sizeof(u->name), ROBOT_NAME "_%Y%m%d_%H%M%S.jpg", &t);
-  else snprintf(u->name, sizeof(u->name), ROBOT_NAME "_%lu.jpg", (unsigned long)millis());
+  if (getLocalTime(&t, 10)) strftime(u->name, sizeof(u->name), "XiaoKe_photo_%Y%m%d_%H%M%S.jpg", &t);
+  else snprintf(u->name, sizeof(u->name), "XiaoKe_photo_%lu.jpg", (unsigned long)millis());
   // 檔名含中文，網址要編碼
   String enc;
   for (const char *c = u->name; *c; c++) {
@@ -1542,6 +1569,8 @@ int refreshPlaylist() {
 
 void playlistTask(void *) {
   refreshPlaylist();
+  fetchMp3List();
+  fetchPortalTools();
   vTaskDelete(nullptr);
 }
 
@@ -1588,7 +1617,180 @@ bool makeQr(const String &text) {
 uint32_t songSince = 0;
 int lastSong = -1;
 
-void singSong() {
+// ---- 唱歌：直接播放 Google 雲端硬碟資料夾裡的 MP3（自己創作的歌）----
+//  資料夾設成「知道連結的任何人都能檢視」，小柯讀資料夾的公開清單頁，再下載 MP3 到 PSRAM 解碼播放
+std::vector<Mp3Song> mp3Songs;
+
+// 比對歌名用：去掉副檔名、空白與標點、複本尾碼「(1)」「_3」
+String normTitle(String s) {
+  if (s.endsWith(".mp3") || s.endsWith(".mp4")) s.remove(s.length() - 4);
+  static const char *DROP[] = {" ", "　", "，", "。", "、", "：", "！", "？", "(", ")", "（", "）", "《", "》", "「", "」", "_", "-", ".", ",", ":", "!", "?"};
+  for (auto d : DROP) s.replace(d, "");
+  while (s.length() && isdigit((uint8_t)s[s.length() - 1])) s.remove(s.length() - 1);
+  return s;
+}
+
+String songsFolderId() {
+  String f = SONGS_MP3_FOLDER;
+  int k = f.indexOf("folders/");
+  if (k >= 0) { f = f.substring(k + 8); int q = f.indexOf('?'); if (q >= 0) f = f.substring(0, q); }
+  return f;
+}
+
+// 讀雲端資料夾清單（embeddedfolderview 公開頁），更新 mp3Songs；回傳歌曲數（失敗 -1）
+int fetchMp3List() {
+  String folder = songsFolderId();
+  if (folder.isEmpty()) return -1;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, "https://drive.google.com/embeddedfolderview?id=" + folder);
+  int code = http.GET();
+  String html = code == 200 ? http.getString() : String("");
+  http.end();
+  if (code != 200) { Serial.printf("MP3 歌單讀取失敗 %d\n", code); return -1; }
+  std::vector<Mp3Song> v;
+  int pos = 0;
+  for (;;) {
+    int a = html.indexOf("id=\"entry-", pos);
+    if (a < 0) break;
+    a += 10;
+    int b = html.indexOf('"', a);
+    int t = html.indexOf("flip-entry-title\">", b);
+    if (b < 0 || t < 0) break;
+    t += 18;
+    int e = html.indexOf('<', t);
+    String id = html.substring(a, b), title = html.substring(t, e);
+    title.replace("&amp;", "&"); title.replace("&#39;", "'"); title.replace("&quot;", "\"");
+    if (title.endsWith(".mp3") || title.endsWith(".MP3")) v.push_back({id, title.substring(0, title.length() - 4)});
+    pos = e;
+  }
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  mp3Songs = v;
+  xSemaphoreGive(songLock);
+  Serial.printf("MP3 歌單：%d 首\n", (int)v.size());
+  return v.size();
+}
+
+// 下載整首 MP3 到 PSRAM（一首約 2~4MB）；回傳長度，失敗 0
+size_t downloadMp3(const String &id, uint8_t **out) {
+  const size_t CAP = 12 * 1024 * 1024;
+  *out = nullptr;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, "https://drive.usercontent.google.com/download?id=" + id + "&export=download&confirm=t");
+  int code = http.GET();
+  if (code != 200) { http.end(); Serial.printf("MP3 下載失敗 %d\n", code); return 0; }
+  int total = http.getSize();
+  size_t cap = total > 0 ? min((size_t)total, CAP) : CAP;
+  uint8_t *buf = (uint8_t *)ps_malloc(cap);
+  size_t len = 0;
+  if (buf) {
+    WiFiClient *st = http.getStreamPtr();
+    uint32_t last = millis();
+    while (len < cap && (total < 0 || (int)len < total) && millis() - last < 10000) {
+      size_t a = st->available();
+      if (a) { len += st->readBytes(buf + len, min(a, cap - len)); last = millis(); }
+      else if (!http.connected()) break;
+      else delay(2);
+    }
+  }
+  http.end();
+  if (len < 4096) { free(buf); return 0; }
+  *out = buf;
+  return len;
+}
+
+// 解碼並播放（阻塞到唱完或點螢幕）；回傳 true = 被點螢幕停止
+bool playMp3(uint8_t *data, size_t len) {
+  HMP3Decoder h = MP3InitDecoder();
+  if (!h) return false;
+  static int16_t pcm[MAX_NCHAN * MAX_NGRAN * MAX_NSAMP];
+  static int16_t out[MAX_NGRAN * MAX_NSAMP * 2 * 2];
+  uint8_t *p = data;
+  int left = len;
+  uint32_t ramp = 0, samples = 0;
+  bool stopped = false, wasTouched = buttonPressed();
+  songPosMs = 0;
+  songPlaying = true;
+  lcdBacklight(min(LCD_BRIGHTNESS, SPEAK_BRIGHTNESS));            // 和說話一樣：唱歌時螢幕調暗，避免掉電重開
+  while (left > 0) {
+    bool t = buttonPressed();
+    if (t && !wasTouched) { stopped = true; break; }                // 點螢幕：停止
+    wasTouched = t;
+    int off = MP3FindSyncWord(p, left);
+    if (off < 0) break;
+    p += off; left -= off;
+    int err = MP3Decode(h, &p, &left, pcm, 0);
+    if (err == ERR_MP3_INDATA_UNDERFLOW) break;
+    if (err) { if (left > 0) { p++; left--; } continue; }        // 壞掉的影格：跳過
+    MP3FrameInfo fi;
+    MP3GetLastFrameInfo(h, &fi);
+    int n = fi.outputSamps / max(1, fi.nChans);
+    if (songDurMs == 0 && fi.bitrate > 0) songDurMs = (uint32_t)((uint64_t)len * 8000 / fi.bitrate);
+    // 轉成 24kHz 立體聲（轉檔時已是 24kHz；其他取樣率用最近鄰換算）
+    int outN = fi.samprate == I2S_RATE ? n : (int)((int64_t)n * I2S_RATE / max(1, fi.samprate));
+    outN = min(outN, (int)(sizeof(out) / 4));
+    int vol = volumePct;
+    int64_t acc = 0;
+    for (int i = 0; i < outN; i++) {
+      int si = fi.samprate == I2S_RATE ? i : (int)((int64_t)i * fi.samprate / I2S_RATE);
+      int32_t s = fi.nChans == 2 ? ((int32_t)pcm[si * 2] + pcm[si * 2 + 1]) / 2 : pcm[si];
+      s = s * vol / 100;
+      const uint32_t RAMP = I2S_RATE / 5;
+      if (ramp < RAMP) s = s * (int32_t)ramp++ / (int32_t)RAMP;
+      s = constrain(s, -SPK_LIMIT, SPK_LIMIT);
+      out[i * 2] = out[i * 2 + 1] = s;
+      acc += abs(s);
+    }
+    speakLevel = (int)(acc / max(1, outN)) * 2;                    // 嘴巴跟著節奏開合
+    audioI2S.write((uint8_t *)out, outN * 4);
+    samples += outN;
+    songPosMs = (uint32_t)((uint64_t)samples * 1000 / I2S_RATE);
+  }
+  memset(out, 0, sizeof(out));
+  for (int i = 0; i < 4; i++) audioI2S.write((uint8_t *)out, sizeof(out));
+  speakLevel = 0;
+  songPlaying = false;
+  lcdBacklight(LCD_BRIGHTNESS);
+  MP3FreeDecoder(h);
+  while (buttonPressed()) delay(10);                               // 等手指離開，避免接著打開說明
+  return stopped;
+}
+
+// 找使用者點名的歌：「唱千江有水千江月」→ 對應的 MP3 索引，找不到 -1
+int findRequestedMp3(const String &userText) {
+  String u = normTitle(userText);
+  int best = -1, bestLen = 0;
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  for (size_t i = 0; i < mp3Songs.size(); i++) {
+    String t = normTitle(mp3Songs[i].title);
+    if (t.length() >= 6 && u.indexOf(t) >= 0 && (int)t.length() > bestLen) { best = i; bestLen = t.length(); }
+  }
+  xSemaphoreGive(songLock);
+  return best;
+}
+
+// 用 MP3 歌名找 YouTube 播放清單裡同一首（封面與 QR 碼用）
+bool findYoutube(const String &title, String &ytId) {
+  String t = normTitle(title);
+  bool ok = false;
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  for (auto &s : songs) {
+    String y = normTitle(s.title);
+    if (y.length() && (y.indexOf(t) >= 0 || t.indexOf(y) >= 0)) { ytId = s.id; ok = true; break; }
+  }
+  xSemaphoreGive(songLock);
+  return ok;
+}
+
+// 只有 YouTube 歌單時：介紹歌曲 + QR 碼（手機播放）
+void singYoutubeOnly() {
   xSemaphoreTake(songLock, portMAX_DELAY);
   int n = songs.size();
   Song s;
@@ -1614,6 +1816,680 @@ void singSong() {
     waitPlaybackDone();
   songSince = millis();
   lastInteraction = millis();
+}
+
+void exitSong();
+
+// 唱歌：有雲端 MP3 就直接唱出來；userText 有點歌名就唱那首
+void singSong(const String &userText) {
+  setUi(UI_THINK, "選歌中…", "");
+  fetchMp3List();                                                  // 每次重讀，雲端新增的歌馬上就能唱
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  int n = mp3Songs.size();
+  xSemaphoreGive(songLock);
+  if (!n) { singYoutubeOnly(); return; }
+
+  int idx = findRequestedMp3(userText);
+  if (idx < 0) {
+    idx = random(n);
+    if (n > 1) while (idx == lastSong) idx = random(n);
+  }
+  lastSong = idx;
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  Mp3Song m = mp3Songs[idx];
+  xSemaphoreGive(songLock);
+  Serial.println("唱歌（MP3）：" + m.title);
+
+  String ytId;
+  bool hasYt = findYoutube(m.title, ytId);
+  thumbOk = hasYt && fetchThumb(ytId);
+  if (hasYt) makeQr("https://youtu.be/" + ytId); else qrSize = 0;
+  songDurMs = 0; songPosMs = 0;
+  songLoading = true;
+  setUi(UI_SONG, m.title, hasYt ? ytId : String(""));
+  songSince = millis();
+
+  uint8_t *data = nullptr;                                         // 先下載（和介紹詞同時進行會搶網路，依序做）
+  size_t len = downloadMp3(m.id, &data);
+  songLoading = false;
+  if (!len) {
+    speakExpr = EX_SAD;
+    speakAndShow("這首歌下載失敗，請確認雲端資料夾已經設成知道連結的人都能檢視。");
+    exitSong();
+    return;
+  }
+  if (speak("我來唱《" + m.title + "》給你聽！這是" SONG_COMPOSER "創作的歌。")) waitPlaybackDone();
+  bool stopped = playMp3(data, len);
+  free(data);
+  Serial.println(stopped ? "（唱歌：點螢幕停止）" : "（唱歌：唱完了）");
+  exitSong();
+}
+
+// ============================================================================
+//  播 MV：雲端資料夾裡的 .xkv（tools/make_xkv.py 由 MP4 轉成：MJPEG 640x352 + MP3）
+//  邊下載邊播：網路 task 填環狀緩衝 → 播放端拆 chunk；聲音給 I2S task，畫面以聲音時間為準顯示
+// ============================================================================
+std::vector<Mp3Song> mvSongs;
+
+// 讀公開雲端資料夾清單（副檔名 ext），回傳歌曲數（失敗 -1）
+int fetchDriveList(const char *folderUrl, const char *ext, std::vector<Mp3Song> &out) {
+  String f = folderUrl;
+  int k = f.indexOf("folders/");
+  if (k >= 0) { f = f.substring(k + 8); int q = f.indexOf('?'); if (q >= 0) f = f.substring(0, q); }
+  if (f.isEmpty()) return -1;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, "https://drive.google.com/embeddedfolderview?id=" + f);
+  int code = http.GET();
+  String html = code == 200 ? http.getString() : String("");
+  http.end();
+  if (code != 200) { Serial.printf("雲端清單讀取失敗 %d\n", code); return -1; }
+  std::vector<Mp3Song> v;
+  int pos = 0, el = strlen(ext);
+  for (;;) {
+    int a = html.indexOf("id=\"entry-", pos);
+    if (a < 0) break;
+    a += 10;
+    int b = html.indexOf('"', a), t = html.indexOf("flip-entry-title\">", b);
+    if (b < 0 || t < 0) break;
+    t += 18;
+    int e = html.indexOf('<', t);
+    String id = html.substring(a, b), title = html.substring(t, e);
+    title.replace("&amp;", "&"); title.replace("&#39;", "'"); title.replace("&quot;", "\"");
+    String low = title; low.toLowerCase();
+    if (low.endsWith(ext)) v.push_back({id, title.substring(0, title.length() - el)});
+    pos = e;
+  }
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  out = v;
+  xSemaphoreGive(songLock);
+  return v.size();
+}
+
+// ---- 下載環狀緩衝（PSRAM）----
+struct {
+  uint8_t *buf = nullptr; size_t cap = 0;
+  volatile size_t w = 0, r = 0;              // 累計寫入／讀出位元組
+  volatile bool eof = false, stop = false, failed = false;
+  String id;
+} mvNet;
+
+void mvNetTask(void *) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, "https://drive.usercontent.google.com/download?id=" + mvNet.id + "&export=download&confirm=t");
+  int code = http.GET();
+  if (code == 200) {
+    int total = http.getSize();
+    size_t got = 0;
+    WiFiClient *st = http.getStreamPtr();
+    uint32_t last = millis();
+    while (!mvNet.stop && (total < 0 || (int)got < total) && millis() - last < 15000) {
+      size_t space = mvNet.cap - (mvNet.w - mvNet.r);
+      size_t a = st->available();
+      if (!a || space < 4096) {
+        if (!a && !http.connected()) break;
+        delay(2);
+        continue;
+      }
+      size_t wpos = mvNet.w % mvNet.cap;
+      size_t n = min(min(a, space), mvNet.cap - wpos);
+      n = st->readBytes(mvNet.buf + wpos, min(n, (size_t)16384));
+      mvNet.w = mvNet.w + n;
+      got += n;
+      last = millis();
+    }
+  } else {
+    Serial.printf("MV 下載失敗 %d\n", code);
+    mvNet.failed = true;
+  }
+  http.end();
+  mvNet.eof = true;
+  vTaskDelete(nullptr);
+}
+
+// 從環狀緩衝讀 n bytes（等資料）；失敗回傳 false
+bool mvRead(uint8_t *dst, size_t n) {
+  size_t done = 0;
+  while (done < n) {
+    size_t avail = mvNet.w - mvNet.r;
+    if (!avail) {
+      if (mvNet.eof || mvNet.stop) return false;
+      delay(2);
+      continue;
+    }
+    size_t rpos = mvNet.r % mvNet.cap;
+    size_t m = min(min(avail, n - done), mvNet.cap - rpos);
+    memcpy(dst + done, mvNet.buf + rpos, m);
+    mvNet.r = mvNet.r + m;
+    done += m;
+  }
+  return true;
+}
+
+// ---- 聲音：解碼後的 PCM 環狀緩衝 → I2S task ----
+#define MV_PCM_CAP (I2S_RATE * 3)                 // 3 秒
+struct {
+  int16_t *buf = nullptr;
+  volatile size_t w = 0, r = 0;
+  volatile uint32_t played = 0;                    // 已播出的樣本數 = 影音同步的時鐘
+  volatile bool run = false, done = true;
+} mvPcm;
+
+void mvAudioTask(void *) {
+  static int16_t out[480 * 2];
+  uint32_t ramp = 0;
+  while (mvPcm.run) {
+    size_t avail = mvPcm.w - mvPcm.r;
+    if (avail < 480) {                             // 網路跟不上：先送靜音，時鐘不前進（畫面會等）
+      memset(out, 0, sizeof(out));
+      audioI2S.write((uint8_t *)out, sizeof(out));
+      continue;
+    }
+    int vol = volumePct;
+    int64_t acc = 0;
+    for (int i = 0; i < 480; i++) {
+      int32_t s = (int32_t)mvPcm.buf[(mvPcm.r + i) % MV_PCM_CAP] * vol / 100;
+      const uint32_t RAMP = I2S_RATE / 5;
+      if (ramp < RAMP) s = s * (int32_t)ramp++ / (int32_t)RAMP;
+      s = constrain(s, -SPK_LIMIT, SPK_LIMIT);
+      out[i * 2] = out[i * 2 + 1] = s;
+      acc += abs(s);
+    }
+    mvPcm.r = mvPcm.r + 480;
+    speakLevel = (int)(acc / 480) * 2;
+    audioI2S.write((uint8_t *)out, sizeof(out));
+    mvPcm.played = mvPcm.played + 480;
+  }
+  memset(out, 0, sizeof(out));
+  for (int i = 0; i < 4; i++) audioI2S.write((uint8_t *)out, sizeof(out));
+  speakLevel = 0;
+  mvPcm.done = true;
+  vTaskDelete(nullptr);
+}
+
+// 顯示一張 JPEG 畫面（硬體解碼 → 放大 1.6 倍置中）
+static uint8_t *mvJpgIn = nullptr;
+static uint16_t *mvJpgOut = nullptr;
+static size_t mvJpgInCap = 0, mvJpgOutCap = 0;
+void mvShowFrame(const uint8_t *jpg, size_t len, int w, int h, bool hint) {
+  if (len > mvJpgInCap) return;
+  memcpy(mvJpgIn, jpg, len);
+  jpeg_decode_cfg_t cfg = {};
+  cfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
+  cfg.rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR;
+  uint32_t n = 0;
+  jpegLockTake();
+  bool ok = jpeg_decoder_process(jpegDec, &cfg, mvJpgIn, len, (uint8_t *)mvJpgOut, mvJpgOutCap, &n) == ESP_OK;
+  jpegLockGive();
+  if (!ok) return;
+  int ow = (w + 15) & ~15;
+  int dw = LCD_W, dh = h * LCD_W / w, y0 = (LCD_H - dh) / 2;
+  static int xmap[LCD_W];
+  for (int x = 0; x < dw; x++) xmap[x] = x * w / dw;
+  for (int y = 0; y < dh; y++) {
+    const uint16_t *src = mvJpgOut + (y * h / dh) * ow;
+    uint16_t *dst = hiBuf + (y0 + y) * LCD_W;
+    for (int x = 0; x < dw; x++) dst[x] = src[xmap[x]];
+  }
+  if (hint) drawPill("點螢幕：停止播放", 296, C_GREEN);
+  lcdFlush(hiBuf);
+}
+
+int lastMv = -1;
+
+// 找使用者點名的 MV；找不到回傳 -1
+int findRequestedMv(const String &userText) {
+  String u = normTitle(userText);
+  int best = -1, bestLen = 0;
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  for (size_t i = 0; i < mvSongs.size(); i++) {
+    String t = normTitle(mvSongs[i].title);
+    if (t.length() >= 6 && u.indexOf(t) >= 0 && (int)t.length() > bestLen) { best = i; bestLen = t.length(); }
+  }
+  xSemaphoreGive(songLock);
+  return best;
+}
+
+void playMv(const String &userText) {
+  setUi(UI_THINK, "找 MV 中…", "");
+  if (fetchDriveList(SONGS_MV_FOLDER, ".xkv", mvSongs) <= 0) {
+    speakExpr = EX_SAD;
+    speakAndShow("我還沒有 MV 可以播，請把轉好的 MV 檔放到雲端的 MV 資料夾喔。");
+    return;
+  }
+  int n = mvSongs.size();
+  int idx = findRequestedMv(userText);
+  if (idx < 0) { idx = random(n); if (n > 1) while (idx == lastMv) idx = random(n); }
+  lastMv = idx;
+  Mp3Song m = mvSongs[idx];
+  Serial.println("播 MV：" + m.title);
+  if (speak("播放《" + m.title + "》的 MV！點一下螢幕就可以停止。")) waitPlaybackDone();
+
+  // 緩衝區
+  if (!mvNet.buf) { mvNet.cap = 6 * 1024 * 1024; mvNet.buf = (uint8_t *)ps_malloc(mvNet.cap); }
+  if (!mvPcm.buf) mvPcm.buf = (int16_t *)ps_malloc(MV_PCM_CAP * 2);
+  if (!mvJpgIn) {
+    jpeg_decode_memory_alloc_cfg_t ic = {JPEG_DEC_ALLOC_INPUT_BUFFER}, oc = {JPEG_DEC_ALLOC_OUTPUT_BUFFER};
+    mvJpgIn = (uint8_t *)jpeg_alloc_decoder_mem(512 * 1024, &ic, &mvJpgInCap);
+    mvJpgOut = (uint16_t *)jpeg_alloc_decoder_mem(1024 * 576 * 2, &oc, &mvJpgOutCap);
+  }
+  uint8_t *chunk = (uint8_t *)ps_malloc(512 * 1024);
+  if (!mvNet.buf || !mvPcm.buf || !mvJpgIn || !mvJpgOut || !chunk) { free(chunk); showError("記憶體不足，無法播放 MV"); return; }
+
+  mvNet.w = mvNet.r = 0; mvNet.eof = mvNet.stop = mvNet.failed = false; mvNet.id = m.id;
+  setUi(UI_VIDEO, m.title, "");
+  cv->fillScreen(C_BG);
+  drawPill(("《" + m.title + "》MV 載入中…").c_str(), 160, C_GLOW);
+  lcdFlush(hiBuf);
+  xTaskCreatePinnedToCore(mvNetTask, "mvNet", 16384, nullptr, 3, nullptr, 0);
+
+  uint8_t hdr[32];
+  bool ok = mvRead(hdr, 32) && !memcmp(hdr, "XKV1", 4);
+  int w = hdr[4] | hdr[5] << 8, h = hdr[6] | hdr[7] << 8, fps = hdr[8] | hdr[9] << 8;
+  if (!ok || w <= 0 || w > 1024 || h <= 0 || h > 576 || fps <= 0) {
+    mvNet.stop = true;
+    while (!mvNet.eof) delay(10);
+    free(chunk);
+    setUi(UI_IDLE);
+    speakExpr = EX_SAD;
+    speakAndShow(mvNet.failed ? "MV 下載失敗，請確認雲端資料夾已經設成知道連結的人都能檢視。" : "這個 MV 檔案格式不對，請用轉檔工具重新轉一次。");
+    return;
+  }
+  uint32_t t0 = millis();
+  while (mvNet.w < 600 * 1024 && !mvNet.eof && millis() - t0 < 8000) delay(20);   // 先緩衝一點再開播
+
+  HMP3Decoder dec = MP3InitDecoder();
+  static int16_t pcm[MAX_NCHAN * MAX_NGRAN * MAX_NSAMP];
+  mvPcm.w = mvPcm.r = mvPcm.played = 0;
+  mvPcm.run = true; mvPcm.done = false;
+  lcdBacklight(min(LCD_BRIGHTNESS, MV_BRIGHTNESS));
+  xTaskCreatePinnedToCore(mvAudioTask, "mvAud", 4096, nullptr, 5, nullptr, 1);
+
+  uint32_t frame = 0, shown = 0, dropped = 0, start = millis();
+  bool stopped = false, wasTouched = buttonPressed();
+  for (;;) {
+    bool tch = buttonPressed();
+    if (tch && !wasTouched) { stopped = true; break; }
+    wasTouched = tch;
+    uint8_t ch[4];
+    if (!mvRead(ch, 4)) break;
+    size_t len = ch[1] | ch[2] << 8 | ch[3] << 16;
+    if (len > 512 * 1024 || !mvRead(chunk, len)) break;
+    if (ch[0] == 'A') {
+      uint8_t *p = chunk;
+      int left = len;
+      if (MP3Decode(dec, &p, &left, pcm, 0) == ERR_MP3_NONE) {
+        MP3FrameInfo fi;
+        MP3GetLastFrameInfo(dec, &fi);
+        int ns = fi.outputSamps / max(1, fi.nChans);
+        while (MV_PCM_CAP - (mvPcm.w - mvPcm.r) < (size_t)ns && mvPcm.run) {   // 聲音緩衝滿：等它播
+          if (buttonPressed() && !wasTouched) { stopped = true; break; }
+          delay(2);
+        }
+        if (stopped) break;
+        for (int i = 0; i < ns; i++) mvPcm.buf[(mvPcm.w + i) % MV_PCM_CAP] = fi.nChans == 2 ? (pcm[i * 2] + pcm[i * 2 + 1]) / 2 : pcm[i];
+        mvPcm.w = mvPcm.w + ns;
+      }
+    } else if (ch[0] == 'V') {
+      uint32_t due = frame * 1000 / fps;            // 這張畫面該出現的時間（ms）
+      frame++;
+      uint32_t now = (uint32_t)((uint64_t)mvPcm.played * 1000 / I2S_RATE);
+      if (now > due + 250) { dropped++; continue; } // 畫面落後太多：略過
+      while (now + 5 < due) {                       // 太早：等聲音追上
+        if (buttonPressed() && !wasTouched) { stopped = true; break; }
+        delay(3);
+        now = (uint32_t)((uint64_t)mvPcm.played * 1000 / I2S_RATE);
+        if (mvPcm.w == mvPcm.r && mvNet.eof) break;
+      }
+      if (stopped) break;
+      mvShowFrame(chunk, len, w, h, millis() - start < 4000);
+      shown++;
+    }
+  }
+  if (!stopped) while (mvPcm.w - mvPcm.r >= 480 && !buttonPressed()) delay(20);   // 把剩下的聲音播完
+  mvNet.stop = true;
+  mvPcm.run = false;
+  while (!mvPcm.done || !mvNet.eof) delay(10);
+  MP3FreeDecoder(dec);
+  free(chunk);                                      // 播完把緩衝區還給系統（錄影、拍照要用）
+  free(mvNet.buf); mvNet.buf = nullptr;
+  free(mvPcm.buf); mvPcm.buf = nullptr;
+  free(mvJpgIn); mvJpgIn = nullptr; mvJpgInCap = 0;
+  free(mvJpgOut); mvJpgOut = nullptr; mvJpgOutCap = 0;
+  lcdBacklight(LCD_BRIGHTNESS);
+  Serial.printf("MV 結束：顯示 %u 張、略過 %u 張%s\n", (unsigned)shown, (unsigned)dropped, stopped ? "（點螢幕停止）" : "");
+  while (buttonPressed()) delay(10);
+  setUi(UI_IDLE);
+  flushMic(200);
+  lastInteraction = millis();
+}
+
+// ============================================================================
+//  工作站語音問答：下載網站資料 → 板子上用關鍵字找最相關段落 → 交給 AI 回答
+// ============================================================================
+static const char *KNOW_NAME[] = {"照顧服務員技術稽核", "居家服務督導員工作手冊", "照服員單一級學科測驗", "照服員術科練習本", "長照組合計算系統"};
+static const char *KNOW_URL[] = {
+  "https://achir1015.github.io/caregiver-skills-audit/data.js",
+  "https://achir1015.github.io/home-care-supervisor-manual/data.js",
+  "https://docs.google.com/spreadsheets/d/1DHrXPAgagusv1DiVVf9hjIGy_IKOCTok2zkfMobNMPY/gviz/tq?tqx=out:csv&sheet=%E5%B7%A5%E4%BD%9C%E8%A1%A81",
+  "https://achir1015.github.io/care-exam-practice/",
+  "https://achir1015.github.io/Long-term-care-combined-calculation-system/"};
+static const char *KNOW_EXAMPLE[] = {"「冰枕使用技術的稽核項目有哪些？」", "「居督員家訪要注意什麼？」",
+                                     "「預防泌尿道感染的考題答案是什麼？」", "「術科洗手的步驟是什麼？」", "「BA01 基本身體清潔一次多少錢？」"};
+static const std::initializer_list<const char *> KNOW_KEYS[] = {
+  {"稽核"},
+  {"督導", "居督", "工作手冊", "家訪", "個案管理"},
+  {"學科", "題庫", "考題", "選擇題", "模擬考", "答案是"},
+  {"術科", "考場", "操作步驟", "扣分", "易錯"},
+  {"組合", "給付", "額度", "碼別", "自付", "部分負擔", "支付價格", "BA0", "BA1", "AA0", "GA0", "SC0"}};
+const int KNOW_N = sizeof(KNOW_NAME) / sizeof(KNOW_NAME[0]);
+static char *knowText[5] = {nullptr};
+static size_t knowLen[5] = {0};
+static uint32_t knowAt[5] = {0};
+
+int knowledgeForTool(const String &name) {
+  for (int i = 0; i < KNOW_N; i++) if (name == KNOW_NAME[i]) return i;
+  return -1;
+}
+
+int matchKnowledge(const String &q) {
+  String u = q;                                                   // 只把英文字母轉大寫（String::toUpperCase 會弄壞中文）
+  for (size_t i = 0; i < u.length(); i++) if (u[i] >= 'a' && u[i] <= 'z') u.setCharAt(i, u[i] - 32);
+  for (int i = 0; i < KNOW_N; i++)
+    for (auto k : KNOW_KEYS[i]) if (u.indexOf(k) >= 0) return i;
+  return -1;
+}
+
+bool loadKnowledge(int i) {
+  if (knowText[i] && millis() - knowAt[i] < 6UL * 3600 * 1000) return true;   // 6 小時內用快取
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, KNOW_URL[i]);
+  int code = http.GET();
+  if (code != 200) { http.end(); Serial.printf("資料下載失敗 %s %d\n", KNOW_NAME[i], code); return knowText[i] != nullptr; }
+  const size_t CAP = 1024 * 1024;
+  char *buf = (char *)ps_malloc(CAP + 1);
+  size_t len = 0;
+  if (buf) {
+    WiFiClient *st = http.getStreamPtr();
+    int total = http.getSize();
+    uint32_t last = millis();
+    while (len < CAP && (total < 0 || (int)len < total) && millis() - last < 8000) {
+      size_t a = st->available();
+      if (a) { len += st->readBytes(buf + len, min(a, CAP - len)); last = millis(); }
+      else if (!http.connected()) break;
+      else delay(2);
+    }
+    buf[len] = 0;
+  }
+  http.end();
+  if (!buf || len < 100) { free(buf); return knowText[i] != nullptr; }
+  free(knowText[i]);
+  knowText[i] = buf; knowLen[i] = len; knowAt[i] = millis();
+  Serial.printf("資料載入 %s %u bytes\n", KNOW_NAME[i], (unsigned)len);
+  return true;
+}
+
+// 找出和問題最相關的段落（以中文兩字詞比對），最多約 3500 bytes
+String knowledgeContext(int i, const String &question) {
+  if (!loadKnowledge(i)) return "";
+  std::vector<String> grams;
+  const char *q = question.c_str();
+  int ql = question.length();
+  for (int p = 0; p + 6 <= ql;) {                                 // 中文字 UTF-8 每字 3 bytes：取相鄰兩字
+    uint8_t c = q[p];
+    if ((c >> 4) == 14 && ((uint8_t)q[p + 3] >> 4) == 14) {
+      String g = question.substring(p, p + 6);
+      if (g != "什麼" && g != "哪些" && g != "多少" && g != "是不" && g != "可以" && g != "請問" && g != "怎麼" && g != "如何")
+        grams.push_back(g);
+      p += 3;
+    } else p += (c < 0x80) ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4;
+  }
+  for (int p = 0; p < ql;) {                                      // 英數字詞（例如 BA01）
+    if (isalnum((uint8_t)q[p])) { int e = p; while (e < ql && isalnum((uint8_t)q[e])) e++; if (e - p >= 2) grams.push_back(question.substring(p, e)); p = e; }
+    else p++;
+  }
+  const char *t = knowText[i];
+  size_t len = knowLen[i];
+  const size_t CH = 700;
+  struct Hit { size_t pos; int score; };
+  std::vector<Hit> hits;
+  for (size_t pos = 0; pos < len; pos += CH / 2) {                // 段落重疊一半，避免答案剛好被切開
+    size_t end = min(len, pos + CH);
+    int score = 0;
+    for (auto &g : grams) {
+      if (std::search(t + pos, t + end, g.c_str(), g.c_str() + g.length()) != t + end) score += g.length() > 6 ? 3 : 2;
+    }
+    if (score > 0) hits.push_back({pos, score});
+  }
+  std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) { return a.score > b.score; });
+  String out = String("以下是「") + KNOW_NAME[i] + "」的資料片段（原始格式，可能含程式碼符號），請根據內容回答，資料沒有的不要亂編：\n";
+  std::vector<size_t> used;
+  for (auto &h : hits) {
+    if (out.length() > 3500) break;
+    bool dup = false;
+    for (auto u : used) if ((h.pos > u ? h.pos - u : u - h.pos) < CH) dup = true;
+    if (dup) continue;
+    used.push_back(h.pos);
+    size_t s = h.pos, e = min(len, h.pos + CH);
+    while (s > 0 && ((uint8_t)t[s] & 0xC0) == 0x80) s--;          // 對齊 UTF-8 字元邊界
+    while (e < len && ((uint8_t)t[e] & 0xC0) == 0x80) e++;
+    out += "…" + String(t + s).substring(0, e - s) + "…\n";
+  }
+  Serial.printf("[問答] %s：%d 個關鍵詞、命中 %d 段，送出 %u bytes\n", KNOW_NAME[i], (int)grams.size(), (int)hits.size(), (unsigned)out.length());
+  return hits.empty() ? String("「") + KNOW_NAME[i] + "」的資料裡找不到和問題相關的內容。\n" : out;
+}
+
+
+// ============================================================================
+//  病房助理工作站：觸控選單（工具清單開機時從工作站網頁解析，新增工具會自動更新）
+// ============================================================================
+struct PortalCat { String id, name; };
+struct PortalTool { String name, desc, url, cat; };
+std::vector<PortalCat> portalCats;
+std::vector<PortalTool> portalTools;
+volatile int portalCat = -1, portalPage = 0, portalSel = -1;   // 類別（-1 = 全部）、頁數、選中的工具（-1 = 清單）
+uint32_t portalSince = 0;
+const int PORTAL_PER_PAGE = 8;
+
+// 取出 key:'值' 或 key:"值"
+String jsField(const String &s, const char *key) {
+  String k = String(key) + ":";
+  int a = s.indexOf(k);
+  if (a < 0) return "";
+  a += k.length();
+  while (a < (int)s.length() && s[a] == ' ') a++;
+  if (a >= (int)s.length()) return "";
+  char q = s[a];
+  if (q != '\'' && q != '"') return "";
+  int b = s.indexOf(q, a + 1);
+  return b > a ? s.substring(a + 1, b) : String("");
+}
+
+int fetchPortalTools() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.begin(client, PORTAL_URL);
+  int code = http.GET();
+  String html = code == 200 ? http.getString() : String("");
+  http.end();
+  if (code != 200) { Serial.printf("工作站清單讀取失敗 %d\n", code); return -1; }
+  std::vector<PortalCat> cats;
+  std::vector<PortalTool> tools;
+  for (int p = 0; (p = html.indexOf("new Category(", p)) >= 0; p++) {   // new Category('admin', '排班與行政', …)
+    int e = html.indexOf(')', p);
+    String s = html.substring(p + 13, e);
+    std::vector<String> parts;
+    for (int i = 0; i < 2; i++) {
+      int a = s.indexOf('\''), b = a >= 0 ? s.indexOf('\'', a + 1) : -1;
+      if (a < 0 || b < 0) break;
+      parts.push_back(s.substring(a + 1, b));
+      s = s.substring(b + 1);
+    }
+    if (parts.size() == 2) cats.push_back({parts[0], parts[1]});
+  }
+  for (int p = 0; (p = html.indexOf("new Tool({", p)) >= 0; p++) {
+    int e = html.indexOf("})", p);
+    String s = html.substring(p, e);
+    PortalTool t{jsField(s, "name"), jsField(s, "desc"), jsField(s, "url"), jsField(s, "category")};
+    if (t.name.length() && t.url.length()) tools.push_back(t);
+  }
+  if (tools.empty()) return -1;
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  portalCats = cats;
+  portalTools = tools;
+  xSemaphoreGive(songLock);
+  Serial.printf("工作站：%d 類、%d 個工具\n", (int)cats.size(), (int)tools.size());
+  return tools.size();
+}
+
+// 目前類別的工具索引
+std::vector<int> portalFiltered() {
+  std::vector<int> v;
+  for (size_t i = 0; i < portalTools.size(); i++)
+    if (portalCat < 0 || portalCat >= (int)portalCats.size() || portalTools[i].cat == portalCats[portalCat].id) v.push_back(i);
+  return v;
+}
+
+String portalCatName(const String &id) {
+  for (auto &c : portalCats) if (c.id == id) return c.name;
+  return "";
+}
+
+// ---- 版面（邏輯座標 512x300）----
+bool inBtn(const Btn &b, int x, int y) { return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h; }
+void drawBtn(const Btn &b, const char *label, uint16_t bg, uint16_t fg) {
+  cv->fillRoundRect(b.x, b.y, b.w, b.h, 6, bg);
+  u8f.setForegroundColor(fg);
+  u8f.drawUTF8(b.x + (b.w - u8f.getUTF8Width(label)) / 2, b.y + b.h / 2 + 6, label);
+}
+Btn catTab(int i, int n) { int w = (SCREEN_W - 16) / n; return {8 + i * w, 80, w - 4, 24}; }
+Btn toolCard(int k) { return {8 + (k % 2) * 250, 110 + (k / 2) * 46, 244, 42}; }
+
+String clipText(const String &s, int w) {                       // 超過寬度就截斷加「…」
+  if (u8f.getUTF8Width(s.c_str()) <= w) return s;
+  String out;
+  for (size_t i = 0; i < s.length();) {
+    uint8_t c = s[i];
+    int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4;
+    String next = out + s.substring(i, i + len);
+    if (u8f.getUTF8Width((next + "…").c_str()) > w) break;
+    out = next; i += len;
+  }
+  return out + "…";
+}
+
+void drawPortalMenu(uint32_t now) {
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  u8f.setForegroundColor(C_ORANGE);
+  u8f.drawUTF8(8, 68, PORTAL_NAME);
+  drawBtn(BTN_HOME, "回主畫面", C_BAR_LINE, C_WHITE);
+  if (portalTools.empty()) {
+    u8f.setForegroundColor(C_GRAY);
+    u8f.drawUTF8(8, 120, "讀取工具清單中…（需要網路）");
+    xSemaphoreGive(songLock);
+    return;
+  }
+  int sel = portalSel;
+  if (sel >= 0 && sel < (int)portalTools.size()) {                // ---- 詳細頁 ----
+    const PortalTool &t = portalTools[sel];
+    u8f.setForegroundColor(C_GLOW);
+    u8f.drawUTF8(8, 104, t.name.c_str());
+    u8f.setForegroundColor(C_GRAY);
+    u8f.drawUTF8(8, 126, ("類別：" + portalCatName(t.cat)).c_str());
+    std::vector<String> ls = u8f.wrap(t.desc, 272);
+    u8f.setForegroundColor(C_WHITE);
+    for (size_t i = 0; i < ls.size() && i < 3; i++) u8f.drawUTF8(8, 150 + i * LINE_H, ls[i].c_str());
+    int y = 150 + min((int)ls.size(), 3) * LINE_H + 10;
+    int k = knowledgeForTool(t.name);
+    u8f.setForegroundColor(k >= 0 ? C_GREEN : C_GRAY);
+    std::vector<String> hs = u8f.wrap(k >= 0 ? String("可以直接用說的問我這個工具的內容，例如：") + KNOW_EXAMPLE[k] : String("這個工具要用手機開啟操作，請掃描右邊的 QR 碼。"), 272);
+    for (size_t i = 0; i < hs.size() && i < 4; i++) u8f.drawUTF8(8, y + i * LINE_H, hs[i].c_str());
+    drawQr(296, 84, 200);
+    u8f.setForegroundColor(C_GRAY);
+    u8f.drawUTF8(296 + (200 - u8f.getUTF8Width("手機掃描開啟")) / 2, 300 - 6, "手機掃描開啟");
+    drawBtn(BTN_BACK, "返回清單", C_BAR_LINE, C_WHITE);
+    xSemaphoreGive(songLock);
+    return;
+  }
+  // ---- 清單頁：類別分頁 + 工具卡 ----
+  int n = portalCats.size() + 1;
+  for (int i = 0; i < n; i++) {
+    bool on = (i == 0 && portalCat < 0) || (i > 0 && portalCat == i - 1);
+    drawBtn(catTab(i, n), i == 0 ? "全部" : portalCats[i - 1].name.c_str(), on ? C_GLOW_DIM : C_PANEL, on ? C_WHITE : C_GRAY);
+  }
+  std::vector<int> v = portalFiltered();
+  int pages = max(1, (int)((v.size() + PORTAL_PER_PAGE - 1) / PORTAL_PER_PAGE));
+  int pg = constrain((int)portalPage, 0, pages - 1);
+  if (pages > 1) {
+    drawBtn(BTN_PREV, "上一頁", pg > 0 ? C_BAR_LINE : C_PANEL, pg > 0 ? C_WHITE : C_GRAY);
+    drawBtn(BTN_NEXT, "下一頁", pg < pages - 1 ? C_BAR_LINE : C_PANEL, pg < pages - 1 ? C_WHITE : C_GRAY);
+    char pn[12]; snprintf(pn, sizeof(pn), "%d/%d", pg + 1, pages);
+    u8f.setForegroundColor(C_GRAY);
+    u8f.drawUTF8(200, 68, pn);
+  }
+  for (int k = 0; k < PORTAL_PER_PAGE && pg * PORTAL_PER_PAGE + k < (int)v.size(); k++) {
+    const PortalTool &t = portalTools[v[pg * PORTAL_PER_PAGE + k]];
+    Btn b = toolCard(k);
+    cv->fillRoundRect(b.x, b.y, b.w, b.h, 6, C_PANEL);
+    cv->drawRoundRect(b.x, b.y, b.w, b.h, 6, C_BAR_LINE);
+    u8f.setForegroundColor(knowledgeForTool(t.name) >= 0 ? C_GLOW : C_WHITE);
+    u8f.drawUTF8(b.x + 8, b.y + 18, clipText(t.name, b.w - 16).c_str());
+    u8f.setForegroundColor(C_GRAY);
+    u8f.drawUTF8(b.x + 8, b.y + 36, clipText(t.desc, b.w - 16).c_str());
+  }
+  u8f.setForegroundColor(C_GLOW_DIM);
+  if (v.empty()) u8f.drawUTF8(8, 140, "這個類別沒有工具");
+  xSemaphoreGive(songLock);
+}
+
+void openPortalMenu() {
+  portalOpen = true;
+  portalCat = -1; portalPage = 0; portalSel = -1;
+  portalSince = millis();
+  if (portalTools.empty()) fetchPortalTools();
+  setUi(UI_PORTAL);
+  Serial.println("（開啟" PORTAL_NAME "選單）");
+}
+
+// 選單中點螢幕；回傳 true = 要離開
+bool portalTouch(int x, int y) {
+  portalSince = millis();
+  if (inBtn(BTN_HOME, x, y)) return true;
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  if (portalSel >= 0) {
+    if (inBtn(BTN_BACK, x, y)) portalSel = -1;
+    xSemaphoreGive(songLock);
+    setUi(UI_PORTAL);
+    return false;
+  }
+  int n = portalCats.size() + 1;
+  for (int i = 0; i < n; i++)
+    if (inBtn(catTab(i, n), x, y)) { portalCat = i - 1; portalPage = 0; }
+  std::vector<int> v = portalFiltered();
+  int pages = max(1, (int)((v.size() + PORTAL_PER_PAGE - 1) / PORTAL_PER_PAGE));
+  if (pages > 1 && inBtn(BTN_PREV, x, y) && portalPage > 0) portalPage = portalPage - 1;
+  if (pages > 1 && inBtn(BTN_NEXT, x, y) && portalPage < pages - 1) portalPage = portalPage + 1;
+  int pg = constrain((int)portalPage, 0, pages - 1);
+  String url;
+  for (int k = 0; k < PORTAL_PER_PAGE && pg * PORTAL_PER_PAGE + k < (int)v.size(); k++)
+    if (inBtn(toolCard(k), x, y)) { portalSel = v[pg * PORTAL_PER_PAGE + k]; url = portalTools[portalSel].url; }
+  xSemaphoreGive(songLock);
+  if (url.length()) makeQr(url);
+  setUi(UI_PORTAL);
+  return false;
 }
 
 // ---- 攝影（即時影像）與錄影 ----
@@ -1784,11 +2660,11 @@ String recordVideo() {
   tts.cap = 0;
   // 可用記憶體依比例分給聲音（32KB/秒）與影像（約 70KB/秒），兩者差不多同時滿
   size_t freeBlk = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-  size_t budget = freeBlk > 700 * 1024 ? freeBlk - 400 * 1024 : 0;
+  size_t budget = freeBlk > 4 * 1024 * 1024 ? min(freeBlk - 2 * 1024 * 1024, (size_t)12 * 1024 * 1024) : 0;
   recAud.cap = min((size_t)MIC_SAMPLE_RATE * REC_SECONDS, budget * 32 / 77 / 2);
   recAud.buf = (int16_t *)ps_malloc(recAud.cap * 2);
   size_t vcap = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-  vcap = vcap > 400 * 1024 ? vcap - 300 * 1024 : 0;
+  vcap = vcap > 3 * 1024 * 1024 ? min(vcap - 2 * 1024 * 1024, (size_t)8 * 1024 * 1024) : 0;
   uint8_t *vbuf = vcap ? (uint8_t *)ps_malloc(vcap) : nullptr;
   if (!recAud.buf || !vbuf) {
     free(recAud.buf); free(vbuf);
@@ -1970,7 +2846,7 @@ String recordVideo() {
     struct tm t;
     if (getLocalTime(&t, 10)) strftime(name, sizeof(name), "%Y%m%d_%H%M%S", &t);
     else snprintf(name, sizeof(name), "%lu", (unsigned long)millis());
-    String fname = String(ROBOT_NAME "_影片_") + name + ".avi";
+    String fname = String("XiaoKe_video_") + name + ".avi";
     String enc;
     for (size_t i = 0; i < fname.length(); i++) {
       char c = fname[i];
@@ -2300,13 +3176,32 @@ void handleUtterance(size_t samples) {
     enterCamera();
     return;
   }
-  if (containsAny(userText, {"長期照顧", "長照", "照服員", "照顧服務員", "居服員", "居家服務", "居家督導",
-                             "督導員", "長照2.0", "長照3.0", "長照二點零", "長照三點零"})) {
-    showPortal();
+  if (containsAny(userText, {"工作站", "病房助理"}) && !containsAny(userText, {"關閉", "離開", "回主畫面"}) ||
+      (matchKnowledge(userText) < 0 &&
+       containsAny(userText, {"長期照顧", "長照", "照服員", "照顧服務員", "居服員", "居家服務", "居家督導",
+                              "督導員", "長照2.0", "長照3.0", "長照二點零", "長照三點零"}))) {
+    openPortalMenu();
+    speakExpr = EX_HAPPY;
+    speakAndShow("這是" PORTAL_NAME "，點一下工具可以看說明和 QR 碼；技術稽核、督導手冊、學科、術科和長照組合的內容，也可以直接用說的問我喔！");
+    setUi(UI_PORTAL);
     return;
   }
-  if (containsAny(userText, {"唱歌", "唱首歌", "唱一首", "唱個歌", "來首歌", "來一首", "放歌", "聽歌", "播歌", "放首歌"})) {
-    singSong();
+  if (portalOpen && containsAny(userText, {"關閉工作站", "離開工作站", "回主畫面", "回到主畫面"})) {
+    portalOpen = false;
+    setUi(UI_IDLE);
+    return;
+  }
+  String up = userText; up.replace(" ", ""); up.replace("ＭＶ", "MV"); up.replace("ｍｖ", "MV");
+  for (size_t i = 0; i < up.length(); i++) if (up[i] >= 'a' && up[i] <= 'z') up.setCharAt(i, up[i] - 32);
+  if ((up.indexOf("MV") >= 0 || containsAny(userText, {"音樂錄影帶", "歌曲影片", "看影片", "播影片", "放影片", "播放影片"})) &&
+      !containsAny(userText, {"錄製", "錄影"})) {
+    playMv(userText);
+    return;
+  }
+  if (containsAny(userText, {"唱歌", "唱首歌", "唱一首", "唱個歌", "來首歌", "來一首", "放歌", "聽歌", "播歌", "放首歌", "播首歌", "播一首", "放一首",
+                             "聽首歌", "聽一首", "放音樂", "播音樂", "聽音樂", "來點音樂"}) ||
+      (containsAny(userText, {"唱", "播", "放", "聽"}) && findRequestedMp3(userText) >= 0)) {   // 點歌：「唱千江有水千江月」
+    singSong(userText);
     return;
   }
   String reply;
@@ -2333,7 +3228,9 @@ void handleUtterance(size_t samples) {
     bool wantVision = containsAny(userText, {"拍照", "拍張", "拍一張", "照相", "看到", "看看", "這是什麼", "這是啥", "鏡頭", "幫我看", "唸給我聽", "上面寫"});
     bool wantSchedule = !wantVision && looksLikeSchedule(userText);
     bool wantWorkflow = !wantVision && looksLikeWorkflow(userText);
+    int know = (!wantVision && !wantSchedule && !wantWorkflow) ? matchKnowledge(userText) : -1;
     setUi(UI_THINK, wantVision ? "拍照看看，思考中…" : wantSchedule ? "查詢班表中…" : wantWorkflow ? "查詢工作流程中…"
+                    : know >= 0 ? String("查詢《") + KNOW_NAME[know] + "》中…"
                     : (ENABLE_WEB_SEARCH && looksLikeSearch(userText)) ? "上網查詢中…" : "思考中…",
           "你：" + userText);
     chatContext = "";
@@ -2344,6 +3241,7 @@ void handleUtterance(size_t samples) {
           chatContext += fetchScheduleMonth(CATS[c], LABELS[c], ym.first, ym.second);
       }
     if (wantWorkflow) chatContext += fetchTimeline();
+    if (know >= 0) chatContext += knowledgeContext(know, userText);
     if (wantVision) imageUri = captureImageDataUri();
     reply = chatWithGPT(userText, imageUri);
     chatContext = "";
@@ -2532,6 +3430,19 @@ void startWebServer() {
     }
     server.send(200, "text/plain", "ok");
   });
+  server.on("/know", HTTP_GET, [] {                    // 測試：工作站問答會交給 AI 的資料片段，?q=問題
+    String q = server.arg("q");
+    int k = matchKnowledge(q);
+    server.send(200, "text/plain; charset=utf-8", k < 0 ? String("沒有對應的工作站資料") : knowledgeContext(k, q));
+  });
+  server.on("/heap", HTTP_GET, [] {                    // 除錯：記憶體狀況
+    char b[200];
+    snprintf(b, sizeof(b), "internal %u (largest %u, min ever %u)\nDMA %u\nPSRAM %u (largest %u)\n",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    server.send(200, "text/plain", b);
+  });
   server.on("/pin", HTTP_GET, [] {                     // 除錯：設定 GPIO /pin?n=11&v=1
     int n = server.arg("n").toInt(), v = server.arg("v").toInt();
     pinMode(n, OUTPUT);
@@ -2609,6 +3520,7 @@ void setup() {
   Serial.println("\n=== ESP32-P4 7 吋 AI Voice Robot「" ROBOT_NAME "」===");
 
   pinMode(PIN_BOOT, INPUT_PULLUP);
+  // 大於 512 bytes 的一般配置放 PSRAM（預設 4KB 以下都放內部 RAM，歌單/字串會把內部 RAM 吃光，HTTPS 的 DMA 加密就配置不到）
   // 掉電偵測：Arduino 預設第 7 級（最敏感），喇叭一出聲電壓稍降就重開機；調低門檻留一點餘裕
   brownout_hal_config_t bo = {};
   bo.threshold = BROWNOUT_LEVEL; bo.enabled = true; bo.reset_enabled = true;
@@ -2617,7 +3529,6 @@ void setup() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);   // 觸控、ES8311、鏡頭共用
   initDisplay();
   if (!touchInit()) Serial.println("找不到觸控晶片 GT911");
-  if (!jpegInit()) Serial.println("硬體 JPEG 初始化失敗");
 
   wavBuf = (uint8_t *)ps_malloc(44 + MAX_SAMPLES * 2);
   tts.buf = (uint8_t *)ps_malloc(TTS_BUF_BYTES);
@@ -2630,6 +3541,8 @@ void setup() {
   cameraOK = initCamera();
   loadCamTune();
   applyCamTune();
+  if (!jpegInit()) Serial.println("硬體 JPEG 初始化失敗");
+  heap_caps_malloc_extmem_enable(512);   // 鏡頭初始化之後才啟用（鏡頭的 DMA 結構要在內部 RAM）
   xTaskCreatePinnedToCore(playTask, "play", 4096, nullptr, 5, &playTaskHandle, 1);
 
   // 畫面改由 UI task 繪製
@@ -2711,6 +3624,11 @@ void loop() {
       if (buttonPressed()) {
         if (uiState == UI_SONG) exitSong();
         else if (uiState == UI_QR) { setUi(UI_IDLE); while (buttonPressed()) delay(10); }
+        else if (uiState == UI_PORTAL) {
+          if (portalTouch(touchX / 2, touchY / 2)) { portalOpen = false; setUi(UI_IDLE); }
+          while (buttonPressed()) delay(10);
+        }
+        else if (uiState == UI_IDLE && inBtn(BTN_PORTAL_IDLE, touchX / 2, touchY / 2)) { openPortalMenu(); while (buttonPressed()) delay(10); }
         else if (uiState == UI_HELP) onHelpButton();
         else {
           uint32_t t0 = millis();                          // 短按 = 功能說明；按住 = 說話（環境吵時用）
@@ -2720,7 +3638,8 @@ void loop() {
             size_t n = recordUtterance(true);
             if (n) handleUtterance(n);
             flushMic(300);
-            if (uiState != UI_SONG && uiState != UI_CAMERA && uiState != UI_QR) setUi(UI_IDLE);
+            if (portalOpen) setUi(UI_PORTAL);
+            else if (uiState != UI_SONG && uiState != UI_CAMERA && uiState != UI_QR) setUi(UI_IDLE);
             btnPrev = false;
             return;
           }
@@ -2730,6 +3649,9 @@ void loop() {
     }
     btnPrev = buttonPressed();
     if (uiState == UI_QR && millis() - qrSince > PORTAL_SHOW_SEC * 1000UL) setUi(UI_IDLE);   // QR 畫面逾時
+    if (portalOpen && uiState == UI_PORTAL && millis() - max(portalSince, (uint32_t)lastInteraction) > PORTAL_SHOW_SEC * 1000UL) {
+      portalOpen = false; setUi(UI_IDLE);                    // 工作站選單逾時
+    }
     if (uiState == UI_SONG) {                               // 唱歌畫面：暫停聲控（手機正在放歌），時間到回到聊天
       if (millis() - songSince > SONG_SHOW_SEC * 1000UL) exitSong();
       delay(20);
@@ -2761,7 +3683,9 @@ void loop() {
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 5000) {
     lastLog = millis();
-    Serial.printf("[聆聽] rms=%d 噪音=%.0f 門檻=%d\n", rms, noiseFloor, thr);
+    Serial.printf("[聆聽] rms=%d 噪音=%.0f 門檻=%d 內部RAM=%uK(最大塊%uK) DMA=%uK PSRAM=%uK\n", rms, noiseFloor, thr,
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL) / 1024), (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
   }
 
   if (trigger) {
@@ -2771,6 +3695,7 @@ void loop() {
     if (n) handleUtterance(n);
     else Serial.println("（太短，視為雜音）");
     flushMic(300);
-    if (uiState != UI_SONG && uiState != UI_CAMERA && uiState != UI_QR) setUi(UI_IDLE);             // 唱歌畫面要留著
+    if (portalOpen) setUi(UI_PORTAL);                                                            // 工作站選單：回答完回到選單
+    else if (uiState != UI_SONG && uiState != UI_CAMERA && uiState != UI_QR) setUi(UI_IDLE);        // 唱歌畫面要留著
   }
 }

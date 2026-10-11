@@ -190,10 +190,16 @@ void tone440() {
 }
 
 void initCam() {
+  esp_log_level_set("*", ESP_LOG_DEBUG);
   if (!ov02c10Begin((i2c_master_bus_handle_t)i2cBusHandle(0), true)) return;
   if (!cap.begin(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, 2)) { Serial.println("開啟鏡頭裝置失敗"); return; }
   if (!cap.setFormat(ESP_VIDEO_FORMAT_RGB565)) Serial.println("設定格式失敗");
   if (!cap.startCapture()) { Serial.println("啟動擷取失敗"); return; }
+  delay(300);
+  for (uint16_t r : {0x0100, 0x0103, 0x3501, 0x3502, 0x3508, 0x380c, 0x380e, 0x4800, 0x4f00, 0x3016, 0x301b}) {
+    uint8_t v = 0xEE; ovR(ov02c10Dev, r, &v);
+    Serial.printf("[OV reg] %04X=%02X\n", r, v);
+  }
   Serial.printf("鏡頭 OK %lux%lu\n", (unsigned long)cap.getWidth(), (unsigned long)cap.getHeight());
 }
 

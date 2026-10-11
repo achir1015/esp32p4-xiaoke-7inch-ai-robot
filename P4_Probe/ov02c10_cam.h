@@ -63,6 +63,7 @@ static const esp_cam_sensor_format_t ov02c10Format = {
   .reserved = NULL,
 };
 
+esp_cam_sensor_device_t *ov02c10Dev = nullptr;
 struct Ov02c10State { uint32_t exp, gainIdx; };
 static Ov02c10State ov02c10St;
 
@@ -212,6 +213,7 @@ bool ov02c10Begin(i2c_master_bus_handle_t i2cBus, bool ldoAlreadyOn) {
   if (sccb_new_i2c_io(i2cBus, &sc, &io) != ESP_OK) { Serial.println("鏡頭 SCCB 建立失敗"); return false; }
 
   esp_cam_sensor_device_t *dev = (esp_cam_sensor_device_t *)calloc(1, sizeof(esp_cam_sensor_device_t));
+  ov02c10Dev = dev;
   dev->name = (char *)OV02C10_IPA_NAME;   // esp_video 依名稱找 ISP 調校檔
   dev->sccb_handle = io;
   dev->xclk_pin = GPIO_NUM_NC; dev->reset_pin = GPIO_NUM_NC; dev->pwdn_pin = GPIO_NUM_NC;
@@ -224,6 +226,9 @@ bool ov02c10Begin(i2c_master_bus_handle_t i2cBus, bool ldoAlreadyOn) {
   dev->id.pid = (h << 8) | l;
   if (dev->id.pid != OV02C10_PID) { Serial.printf("鏡頭 PID=0x%04X 不是 OV02C10\n", dev->id.pid); free(dev); return false; }
   Serial.println("偵測到 OV02C10");
+  // esp_video 不會呼叫 set_format，要自己先寫入整張初始化表（否則鏡頭用出廠預設值，CSI 收不到畫面；
+  // 10/09 曾誤以為正常，是因為鏡頭沒斷電、還留著原廠韌體寫的設定）
+  if (ovSetFormat(dev, &ov02c10Format) != ESP_OK) { Serial.println("鏡頭初始化表寫入失敗"); free(dev); return false; }
 
   if (esp_video_create_isp_video_device() != ESP_OK) Serial.println("ISP 裝置建立失敗");
   esp_video_csi_device_config_t cc = { .dont_init_ldo = ldoAlreadyOn };

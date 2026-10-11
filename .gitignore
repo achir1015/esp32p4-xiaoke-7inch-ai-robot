@@ -11,3 +11,8 @@ C6_Update/firmware/
 *.docx
 ~$*
 build/
+
+# 自創歌曲音檔／MV（作品與大型檔案，放在雲端硬碟，不放程式 repo）
+songs_mp4/
+songs_mp3/
+songs_mv/

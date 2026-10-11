@@ -123,10 +123,14 @@ bool lcdInit() {
 }
 
 // 把整個畫面（PSRAM 畫布）用 DMA2D 複製到螢幕，等複製完成才返回（之後才能再畫畫布）
+static SemaphoreHandle_t lcdLock = nullptr;
 void lcdFlush(const uint16_t *buf) {
+  if (!lcdLock) lcdLock = xSemaphoreCreateMutex();
+  xSemaphoreTake(lcdLock, portMAX_DELAY);                     // UI 與 MV 播放器不能同時送畫面
   xSemaphoreTake(lcdDoneSem, 0);                              // 清掉殘留訊號
   if (esp_lcd_panel_draw_bitmap(lcdPanel, 0, 0, LCD_W, LCD_H, buf) == ESP_OK)
     xSemaphoreTake(lcdDoneSem, pdMS_TO_TICKS(200));
+  xSemaphoreGive(lcdLock);
 }
 
 // ================================================================ 觸控 ====
@@ -326,7 +330,8 @@ bool camGrab(uint16_t *dst, int dw, int dh, int stride, int skip = 0) {
 
 // ISP 色彩：飽和度 / 對比 0~255（128 = 原始）、亮度 -127~127
 void camSetColor(int sat, int bri, int con) {
-  int fd = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
+  static int fd = -1;                                         // 一直開著：關閉 ISP 裝置會讓鏡頭停止出畫面
+  if (fd < 0) fd = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
   if (fd < 0) { Serial.println("ISP 裝置開啟失敗，無法調色"); return; }
   struct v4l2_ext_control c[3] = {};
   c[0].id = V4L2_CID_SATURATION; c[0].value = constrain(sat, 0, 255);
@@ -337,5 +342,5 @@ void camSetColor(int sat, int bri, int con) {
   cs.count = 3;
   cs.controls = c;
   if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &cs) != 0) Serial.println("ISP 調色失敗");
-  close(fd);
+
 }
