@@ -46,7 +46,7 @@ FQBN: esp32:esp32:esp32p4:ChipVariant=prev3,PSRAM=enabled,FlashSize=16M,Partitio
 ## 注意事項
 
 - **C6 韌體要先更新**：原廠 ESP-Hosted 2.3.2 能掃描 WiFi 但連不上。燒 `C6_Update`，下載 `https://espressif.github.io/arduino-esp32/hosted/esp32c6-v2.12.13.bin`，再執行 `python C6_Update/c6_update.py COM12 <bin>`
-- **喇叭**：板子沒有內建喇叭；接板載喇叭座時，若一出聲就重開機（電腦 USB 供電不足或插頭不合），請改用 5V/2A 充電器或外接 MAX98357A
+- **喇叭**：板子沒有內建喇叭，要接在背面的 MX1.25 2P 喇叭座（8Ω 1–3W）。只接電腦 USB 時，喇叭一出聲電壓會掉而重開機，所以 `config.h` 預設 `SPK_LIMIT 9000`（限幅）、`SPEAK_BRIGHTNESS 25`（說話時螢幕調暗）、`BROWNOUT_LEVEL 4`；改用 5V/2A 充電器供電時，可以把 `SPK_LIMIT` 調高、`SPEAK_BRIGHTNESS` 改 100
 - 螢幕與鏡頭的初始化暫存器值參考自本板原廠韌體
 
 ## 開發者
